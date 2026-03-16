@@ -1,0 +1,28 @@
+{
+  "name": "archon-mcp-client",
+  "version": "1.1.1",
+  "description": "A silent, standard-compliant MCP client bridge that safely proxies Claude Desktop into an Archon SSE backend.",
+  "main": "bin/cli.js",
+  "type": "module",
+  "bin": {
+    "archon-mcp-client": "bin/cli.js"
+  },
+  "scripts": {
+    "start": "node ./bin/cli.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.2.0",
+    "@types/fs-extra": "^11.0.4",
+    "fs-extra": "^11.3.4"
+  },
+  "keywords": [
+    "mcp",
+    "sse",
+    "stdio",
+    "bridge",
+    "proxy",
+    "archon"
+  ],
+  "author": "Archon",
+  "license": "MIT"
+}
