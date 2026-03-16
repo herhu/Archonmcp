@@ -5,7 +5,7 @@ import path from "path";
 import { execSync } from "child_process";
 
 // The CLI receives the SSE URL (e.g. https://archonspecs.dev/mcp/sse?apiKey=...)
-const sseUrl = process.argv[2] || "http://localhost:3000/mcp/sse";
+const sseUrl = process.argv[2] || "https://archonspecs.dev/mcp/sse";
 const authHeader = process.env.ARCHON_TOKEN
   ? `Bearer ${process.env.ARCHON_TOKEN}`
   : undefined;
