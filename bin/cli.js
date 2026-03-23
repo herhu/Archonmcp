@@ -19,6 +19,124 @@ const postUrl = sseUrl.replace("/mcp/sse", "/mcp");
 const LINEAGE_FILE = ".archon/lineage.json";
 const LOCK_FILE = ".archon/sync.lock";
 const SPEC_FILE = "designspec.json";
+const REGIONS_START_REGEX = /\/\/\s*@archon-manual-start:(\S+)/g;
+const REGIONS_END_REGEX = /\/\/\s*@archon-manual-end/g;
+
+/**
+ * Region Management (extracted from Archon Core)
+ */
+function extractRegions(content) {
+  const regions = new Map();
+  let match;
+
+  // 1. Comment-based
+  REGIONS_START_REGEX.lastIndex = 0;
+  while ((match = REGIONS_START_REGEX.exec(content)) !== null) {
+    const id = match[1];
+    const startIdx = match.index + match[0].length;
+    REGIONS_END_REGEX.lastIndex = startIdx;
+    const endMatch = REGIONS_END_REGEX.exec(content);
+    if (endMatch) {
+      regions.set(id, content.substring(startIdx, endMatch.index));
+      REGIONS_START_REGEX.lastIndex = endMatch.index + endMatch[0].length;
+    }
+  }
+
+  // 2. Decorator-based
+  const decoratorRegex = /@ArchonManual\(\)\s*(?:async\s+)?(\w+)\s*\(/g;
+  let decoMatch;
+  while ((decoMatch = decoratorRegex.exec(content)) !== null) {
+    const methodName = decoMatch[1];
+    const decoratorStart = decoMatch.index;
+    const bodyStartIdx = content.indexOf('{', decoMatch.index);
+    if (bodyStartIdx !== -1) {
+      const bodyEndIdx = findClosingBrace(content, bodyStartIdx);
+      if (bodyEndIdx !== -1) {
+        const fullBlock = content.substring(decoratorStart, bodyEndIdx + 1);
+        regions.set(`decorator:${methodName}`, fullBlock);
+        decoratorRegex.lastIndex = bodyEndIdx + 1;
+      }
+    }
+  }
+
+  return regions;
+}
+
+function findClosingBrace(content, startIdx) {
+  let depth = 0;
+  for (let i = startIdx; i < content.length; i++) {
+    if (content[i] === '{') depth++;
+    else if (content[i] === '}') {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function mergeRegions(oldContent, newContent, filePath = "") {
+  const oldRegions = extractRegions(oldContent);
+  if (oldRegions.size === 0) return newContent;
+  let merged = newContent;
+  let mergedCount = 0;
+
+  for (const [id, content] of oldRegions.entries()) {
+    let isMerged = false;
+
+    if (id.startsWith('decorator:')) {
+      const methodName = id.split(':')[1];
+      // Surgical Replace: find the method in the NEW content and replace it
+      const methodPattern = `(?:async\\s+)?${methodName}\\s*\\([\\s\\S]*?\\)\\s*(?::\\s*[\\s\\S]*?)?\\{`;
+      const methodRegex = new RegExp(methodPattern, 'g');
+      
+      const match = methodRegex.exec(merged);
+      if (match) {
+        const bodyStartIdx = match.index + match[0].length - 1; // last {
+        const bodyEndIdx = findClosingBrace(merged, bodyStartIdx);
+        if (bodyEndIdx !== -1) {
+          const prefix = merged.substring(0, match.index);
+          const suffix = merged.substring(bodyEndIdx + 1);
+          merged = prefix + content + suffix;
+          isMerged = true;
+        }
+      }
+
+      if (!isMerged) {
+        // Fallback: append to 'methods' manual region if it exists
+        const methodsPattern = `(\\/\\/\\s*@archon-manual-start:methods)(\\s*[\\s\\S]*?)(\\/\\/\\s*@archon-manual-end)`;
+        const methodsRegex = new RegExp(methodsPattern, 'g');
+        if (methodsRegex.test(merged)) {
+          merged = merged.replace(methodsRegex, (match, p1, p2, p3) => {
+            if (p2.includes(content)) return match;
+            return p1 + p2 + "\n" + content + "\n" + p3;
+          });
+          isMerged = true;
+        }
+      }
+    } else {
+      const escapedId = id.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+      const pattern = `(\\/\\/\\s*@archon-manual-start:${escapedId})(\\s*[\\s\\S]*?)(\\/\\/\\s*@archon-manual-end)`;
+      const regex = new RegExp(pattern, 'g');
+      
+      if (regex.test(merged)) {
+        merged = merged.replace(regex, (m, p1, p2, p3) => p1 + content + p3);
+        isMerged = true;
+      }
+    }
+
+    if (isMerged) {
+      mergedCount++;
+    } else {
+      console.error(`  [WARNING] Manual region '${id}' could not be merged into ${filePath}. Target marker or method missing.`);
+    }
+  }
+
+  if (mergedCount > 0) {
+    console.error(`  - Merged ${mergedCount}/${oldRegions.size} manual regions in ${filePath}`);
+  }
+
+  return merged;
+}
 
 /**
  * Finds the project root by walking up from CWD
@@ -127,21 +245,101 @@ async function handleLocalOnly(method, params, id) {
 
           if (!remoteSpec) throw new Error("Could not retrieve approved spec from remote.");
 
-          // Force generate
-          await fs.writeJSON(path.join(root, SPEC_FILE), remoteSpec, { spaces: 2 });
-          execSync(`npx archon generate -s ${SPEC_FILE} -o . --force --no-qa`, { cwd: root, stdio: "inherit" });
+          // Incremental Sync
+          const oldSpecPath = path.join(root, ".archon/old_spec.json");
+          const localSpecPath = path.join(root, SPEC_FILE);
+          if (fs.existsSync(localSpecPath)) {
+            fs.copySync(localSpecPath, oldSpecPath);
+          }
+          
+          await fs.writeJSON(localSpecPath, remoteSpec, { spaces: 2 });
+          
+          const output = execSync(`npx archon generate -s ${SPEC_FILE} -p .archon/old_spec.json -o . --force --no-qa --json`, { 
+            cwd: root, 
+            encoding: "utf-8" 
+          });
+
+          let resultData;
+          try {
+            resultData = JSON.parse(output.substring(output.indexOf('{')));
+          } catch (e) {
+            throw new Error(`Failed to parse generator output: ${output}`);
+          }
 
           releaseLock(root);
           return {
             jsonrpc: "2.0",
             id,
             result: {
-              content: [{ type: "text", text: `✅ SYNC SUCCESS: Project moved to revision ${remoteRevisionId}.\nManual regions preserved. Lineage updated by generator.` }]
+              content: [{ 
+                type: "text", 
+                text: `✅ SYNC SUCCESS: Project moved to revision ${remoteRevisionId}.\nMode: ${resultData.mode}\nDeltas: ${JSON.stringify(resultData.deltas)}\nCreated: ${resultData.results.created.length}, Updated: ${resultData.results.updated.length}, Skipped: ${resultData.results.skipped.length}`
+              }],
+              structuredContent: {
+                syncResult: resultData,
+                revisionId: remoteRevisionId
+              }
             }
           };
         } catch (e) {
           releaseLock(root);
           return { jsonrpc: "2.0", id, error: { code: -32603, message: `Sync failed: ${e.message}` } };
+        }
+
+      case "archon_sync_via_artifact":
+        if (!root) return { jsonrpc: "2.0", id, error: { code: -32000, message: "No Archon project found." } };
+
+        const artifactUrl = params.arguments?.artifactUrl;
+        if (!artifactUrl) return { jsonrpc: "2.0", id, error: { code: -32000, message: "Missing artifactUrl." } };
+
+        const tempZip = path.join("/tmp", `archon_sync_${Date.now()}.zip`);
+        const tempUnzipDir = path.join("/tmp", `archon_sync_unzip_${Date.now()}`);
+
+        try {
+          console.error(`Downloading artifact from ${artifactUrl}...`);
+          execSync(`curl -L -o ${tempZip} "${artifactUrl}"`, { stdio: "inherit" });
+          
+          await fs.ensureDir(tempUnzipDir);
+          console.error(`Unzipping to ${tempUnzipDir}...`);
+          execSync(`unzip -o ${tempZip} -d ${tempUnzipDir}`, { stdio: "inherit" });
+          
+          // PHASE: SMART MERGE
+          const files = await fs.readdir(tempUnzipDir, { recursive: true });
+          for (const file of files) {
+            const localFile = path.join(root, file);
+            const remoteFile = path.join(tempUnzipDir, file);
+            
+            if (fs.existsSync(localFile) && !fs.lstatSync(localFile).isDirectory()) {
+              const oldContent = await fs.readFile(localFile, "utf-8");
+              const newContent = await fs.readFile(remoteFile, "utf-8");
+              
+              const oldRegions = extractRegions(oldContent);
+              if (oldRegions.size > 0) {
+                const mergedContent = mergeRegions(oldContent, newContent, file);
+                if (mergedContent !== newContent) {
+                  await fs.writeFile(remoteFile, mergedContent);
+                }
+              }
+            }
+          }
+
+          console.error(`Moving merged files to ${root}...`);
+          fs.copySync(tempUnzipDir, root, { overwrite: true });
+
+          fs.removeSync(tempZip);
+          fs.removeSync(tempUnzipDir);
+          
+          return {
+            jsonrpc: "2.0",
+            id,
+            result: {
+              content: [{ type: "text", text: `✅ ARTIFACT SYNC SUCCESS: Files merged and overwritten from ZIP. Manual regions PRESERVED.` }]
+            }
+          };
+        } catch (e) {
+          if (fs.existsSync(tempZip)) fs.removeSync(tempZip);
+          if (fs.existsSync(tempUnzipDir)) fs.removeSync(tempUnzipDir);
+          return { jsonrpc: "2.0", id, error: { code: -32603, message: `Artifact sync failed: ${e.message}` } };
         }
 
       case "archon_diff_local":
@@ -164,28 +362,29 @@ async function handleLocalOnly(method, params, id) {
           const remoteSpec = specRes.result?.structuredContent?.spec;
           if (!remoteSpec) throw new Error("Could not retrieve approved spec from remote.");
 
-          // Force generate into a temporary file
-          const tempSpecFile = path.join(root, ".archon/temp_spec.json");
-          await fs.writeJSON(tempSpecFile, remoteSpec, { spaces: 2 });
+          // Diff into structured output
+          const remoteSpecFile = path.join(root, ".archon/remote_spec.json");
+          await fs.writeJSON(remoteSpecFile, remoteSpec, { spaces: 2 });
           
-          const output = execSync(`npx archon generate -s .archon/temp_spec.json -o . --dry-run --no-qa`, { 
+          const output = execSync(`npx archon generate -s .archon/remote_spec.json -p designspec.json -o . --diff --no-qa --json`, { 
             cwd: root, 
-            encoding: "utf-8",
-            stdio: ["ignore", "pipe", "pipe"] 
+            encoding: "utf-8"
           });
 
-          await fs.remove(tempSpecFile);
+          await fs.remove(remoteSpecFile);
 
-          const created = (output.match(/Would created:/g) || []).length;
-          const merged = (output.match(/Would merged:/g) || []).length;
+          let diffData;
+          try {
+            diffData = JSON.parse(output.substring(output.indexOf('{')));
+          } catch (e) {
+            throw new Error(`Failed to parse diff output: ${output}`);
+          }
+
+          const created = diffData.results.created.length;
+          const updated = diffData.results.updated.length;
+          const skipped = diffData.results.skipped.length;
           
-          // Try to extract some file names
-          const lines = output.split("\n");
-          const changedFiles = lines
-            .filter(l => l.includes("[DryRun] Would"))
-            .map(l => l.split(": ").pop())
-            .map(p => path.relative(root, p))
-            .slice(0, 10);
+          const changedFiles = [...diffData.results.created, ...diffData.results.updated].slice(0, 10);
 
           return { 
             jsonrpc: "2.0", 
@@ -193,8 +392,11 @@ async function handleLocalOnly(method, params, id) {
             result: { 
               content: [{ 
                 type: "text", 
-                text: `🔍 **DIFF PREVIEW**\n\n- Files to create: **${created}**\n- Files to update: **${merged}**\n\n**Example changes:**\n${changedFiles.map(f => `- ${f}`).join("\n")}${changedFiles.length >= 10 ? "\n- ..." : ""}` 
-              }] 
+                text: `🔍 **DIFF PREVIEW** (${diffData.mode})\n\n- Files to create: **${created}**\n- Files to update: **${updated}**\n- Files unchanged: **${skipped}**\n\n**Impacted Areas:**\n${diffData.deltas.map(d => `- ${d.type}${d.domainKey ? ': ' + d.domainKey : ''}`).join("\n")}\n\n**Example changes:**\n${changedFiles.map(f => `- ${f}`).join("\n")}${changedFiles.length >= 10 ? "\n- ..." : ""}` 
+              }],
+              structuredContent: {
+                diffResult: diffData
+              }
             } 
           };
         } catch (e) {
@@ -258,19 +460,42 @@ process.stdin.on("data", async (chunk) => {
       if (request.method === "tools/list") {
         // Add Local Tools
         responseJson.result.tools.push(
-          { name: "archon_read_local_lineage", description: "Read the local lineage manifest.", inputSchema: { type: "object", properties: {} } },
-          { name: "archon_verify_local", description: "Verify local code integrity against lineage.", inputSchema: { type: "object", properties: {} } },
-          { name: "archon_diff_local", description: "Preview changes before sync.", inputSchema: { type: "object", properties: {} } },
+          { 
+            name: "archon_read_local_lineage", 
+            description: "Read the local lineage manifest. Use this to find the projectId and current revisionId before initiating architectural changes.", 
+            inputSchema: { type: "object", properties: {} } 
+          },
+          { 
+            name: "archon_verify_local", 
+            description: "Verify local code integrity against the lineage manifest. Ensures no unauthorized drift occurred.", 
+            inputSchema: { type: "object", properties: {} } 
+          },
+          { 
+            name: "archon_diff_local", 
+            description: "Preview architectural changes before applying them. Recommended before running sync.", 
+            inputSchema: { type: "object", properties: {} } 
+          },
           { 
             name: "archon_sync_local", 
-            description: "Final step of architectural change. Applies latest approved spec to current workspace.",
+            description: "PREFERRED SYNC METHOD: Final step of architectural evolution. Fetches the latest approved DesignSpec from the remote server and regenerates local code while preserving all manual regions (comment-based) and @ArchonManual() decorated methods. Requires a clean Git workspace.",
             inputSchema: { 
               type: "object", 
               properties: { 
-                projectId: { type: "string" },
-                allowDirtyWorkspace: { type: "boolean" }
+                projectId: { type: "string", description: "The permanent project ID from lineage.json" },
+                allowDirtyWorkspace: { type: "boolean", description: "Bypass Git safety check (not recommended)" }
               } 
             } 
+          },
+          {
+            name: "archon_sync_via_artifact",
+            description: "SMART ARTIFACT SYNC: Downloads a generation ZIP artifact and performs a region-aware merge into the current workspace. Preserves all manual code blocks (// @archon-manual-start) and @ArchonManual() decorated methods. Use this if the spec-driven flow fails or to synchronize with a remote build while keeping local customizations.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                artifactUrl: { type: "string", description: "The pre-signed S3 download URL for the project ZIP" }
+              },
+              required: ["artifactUrl"]
+            }
           }
         );
 
