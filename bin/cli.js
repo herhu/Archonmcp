@@ -502,7 +502,7 @@ process.stdin.on("data", async (chunk) => {
         // PHASE FILTERING
         if (!hasProject) {
           responseJson.result.tools = responseJson.result.tools.filter(t => 
-            !["archon_add_domain", "archon_add_entity", "archon_patch_spec", "archon_sync_local", "archon_diff_local", "archon_verify_local"].includes(t.name)
+            !["archon_add_domain", "archon_add_entity", "archon_patch_spec", "archon_sync_local", "archon_diff_local", "archon_verify_local", "archon_read_local_lineage", "archon_sync_via_artifact"].includes(t.name)
           );
         }
       }

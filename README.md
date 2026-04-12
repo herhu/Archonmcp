@@ -2,7 +2,7 @@
 
 🚀 Live: https://archonspecs.dev
 
-A completely silent, standards-compliant [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) client bridge that natively proxies Claude Desktop `stdio` requests directly into an Archon `SSE` remote backend over HTTPS.
+A completely silent, standards-compliant [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) client bridge that natively proxies Claude Desktop `stdio` requests directly into an Archon Specs  `SSE` remote backend over HTTPS.
 
 Unlike other public MCP proxies, this package guarantees complete `stdout` JSON-RPC hygiene, preventing log pollution that crashes Claude Desktop's strict parsers.
 
@@ -25,7 +25,7 @@ You do not need to install this library. Just configure your `claude_desktop_con
 }
 ```
 
-## Archon — AI Backend Architecture Compiler
+## Archon Specs  — AI Backend Architecture Compiler
 
 🌐 Website: https://archonspecs.dev  
 📚 Docs: https://archonspecs.dev/docs.html  
